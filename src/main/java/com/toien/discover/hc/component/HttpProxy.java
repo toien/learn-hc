@@ -1,38 +1,24 @@
 package com.toien.discover.hc.component;
 
 
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.UnsupportedEncodingException;
-import java.net.URI;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.function.Function;
-
+import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
+import com.toien.discover.hc.Constants;
+import com.toien.discover.hc.util.JsonUtil;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpHost;
 import org.apache.http.NameValuePair;
-import org.apache.http.client.ClientProtocolException;
 import org.apache.http.client.CookieStore;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.entity.UrlEncodedFormEntity;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
-import org.apache.http.client.methods.HttpPut;
 import org.apache.http.client.methods.HttpRequestBase;
-import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.client.protocol.HttpClientContext;
 import org.apache.http.cookie.ClientCookie;
 import org.apache.http.cookie.Cookie;
-import org.apache.http.entity.FileEntity;
 import org.apache.http.entity.StringEntity;
-import org.apache.http.entity.mime.MultipartEntityBuilder;
-import org.apache.http.entity.mime.content.FileBody;
 import org.apache.http.impl.client.BasicCookieStore;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
@@ -44,23 +30,30 @@ import org.apache.http.util.EntityUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
-import com.toien.discover.hc.Constants;
-import com.toien.discover.hc.util.JsonUtil;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 
 /**
  * 
  * 基于 Apache HTTP Component 的远程接口调用组件
- * 
- * 注：该类并没不是线程安全的，并且在多个线程中调用，需要保持 state-less
+ * 已配置 http 链接池，超时，采用 UTF-8 编码;
+ * 支持 cookie，contentType 设置，返回值反序列化为自定义类型，callback;
+ * 只实现了 get/post 请求，可自由扩展;
  * 
  * @author goku
  *
  */
 public class HttpProxy {
 	/**
-	 * Options 代表每次 HttpProxy 发出请求的候需要使用的参数；包括了 url, headers, cookie, callback
+	 * Options 代表每次 HttpProxy 发出请求的候需要使用的参数；包括了 uri, headers, cookie, callback
 	 * 它是一个泛型类。
 	 * 
 	 * @param <R>
@@ -77,32 +70,32 @@ public class HttpProxy {
 		private String uri;
 
 		/**
+		 * 请求中的参数，因为 get 请求的参数可能已经附加在了 url 上，所以在具体处理的时候需要判断
+		 */
+		private Map<String, Object> parameters = new HashMap<>();
+
+		/**
+		 * 当调用 post 请求的时候，需要根据 contentType 设置 params
+		 *
+		 * 可用的值有 APPLICATION_JSON, APPLICATION_FORM_URLENCODED
+		 */
+		private String contentType = APPLICATION_JSON;
+
+		/**
 		 * Http 请求的头信息
 		 */
-		private Map<String, String> headers = new HashMap<String, String>();
+		private Map<String, String> headers = new HashMap<>();
 
 		/**
 		 * 请求中所需要携带的 Cookie
 		 */
-		private List<Cookie> cookies = new ArrayList<Cookie>();
+		private List<Cookie> cookies = new ArrayList<>();
 
 		/**
 		 * 请求完成后后，callback 中的数据的类型，目前支持 String， InputStream；默认为 String
 		 * 
 		 */
 		private Class<?> responseType = String.class;
-
-		/**
-		 * 请求中的参数，因为 get 请求的参数可能已经附加在了 url 上，所以在具体处理的时候需要判断
-		 */
-		private Map<String, Object> parameters = new HashMap<String, Object>();
-
-		/**
-		 * 当调用 post 请求的时候，需要根据 contentType 设置 params
-		 * 
-		 * 可用的值有 APPLICATION_JSON, APPLICATION_FORM_URLENCODED
-		 */
-		private String contentType = APPLICATION_JSON;
 
 		/**
 		 * 每次请求的时候的 context，调用 options.parse 会产生，在每次请求之前，HttpProxy 都会调用
@@ -208,7 +201,7 @@ public class HttpProxy {
 		 * 
 		 * @param get
 		 */
-		public void parse(HttpGet get) {
+		private void parse(HttpGet get) {
 			parseBasics(get);
 			parseParameters(get);
 		}
@@ -218,10 +211,8 @@ public class HttpProxy {
 		 * 
 		 * @param
 		 */
-		public void parse(HttpPost post) {
-
+		private void parse(HttpPost post) {
 			parseBasics(post);
-
 			parseParameters(post);
 		}
 
@@ -234,27 +225,22 @@ public class HttpProxy {
 			if (parameters.keySet().isEmpty()) {
 				return;
 			}
-			URI reuqestUri = get.getURI();
-			String requestQueryString = reuqestUri.getRawQuery();
+			URI requestUri = get.getURI();
+			String requestQueryString = requestUri.getRawQuery();
 			StringBuffer paramBuf = new StringBuffer();
 
-			parameters.entrySet().forEach(
-					param -> {
-						String name = param.getKey();
+			parameters.forEach((name, value) -> {
+                if (!Strings.isNullOrEmpty(requestQueryString) && requestQueryString.contains(name + "=")) {
+                    return; // ignore a parameter if it exist in current uri
+                } else {
+                    paramBuf.append(name).append("=").append(value).append("&");
+                }
+            });
 
-						if (!Strings.isNullOrEmpty(requestQueryString)
-								&& requestQueryString.contains(name + "=")) {
-							return; // ignore a parameter if it exist in current
-									// uri
-						} else {
-							paramBuf.append(name).append("=").append(param.getValue()).append("&");
-						}
-
-					});
 			if (paramBuf.length() > 0) {
 				paramBuf.deleteCharAt(paramBuf.length() - 1); // delete last '&'
 
-				String requestUriStr = reuqestUri.toString();
+				String requestUriStr = requestUri.toString();
 				if (requestQueryString == null) {
 					get.setURI(URI.create(requestUriStr.concat("?").concat(paramBuf.toString())));
 				} else if (requestQueryString.isEmpty()) {
@@ -278,15 +264,12 @@ public class HttpProxy {
 			post.setHeader("Content-Type", contentType);
 
 			if (APPLICATION_JSON.equals(contentType)) {
-
 				String parsed = JsonUtil.toJson(parameters, false);
-				StringEntity entity = new StringEntity(parsed,
-						org.apache.http.entity.ContentType.APPLICATION_JSON);
+				StringEntity entity = new StringEntity(parsed, org.apache.http.entity.ContentType.APPLICATION_JSON);
 				post.setEntity(entity);
 
 			} else if (APPLICATION_FORM_URLENCODED.equals(contentType)) {
-
-				List<NameValuePair> pairs = new ArrayList<NameValuePair>();
+				List<NameValuePair> pairs = new ArrayList<>();
 
 				for (Map.Entry<String, Object> entry : parameters.entrySet()) {
 					String key = entry.getKey();
@@ -313,9 +296,7 @@ public class HttpProxy {
 
 			request.setURI(URI.create(uri));
 
-			getHeaders().entrySet().forEach(header -> {
-				request.setHeader(header.getKey(), header.getValue());
-			});
+			getHeaders().forEach(request::setHeader);
 
 			parseCookies();
 		}
@@ -356,7 +337,7 @@ public class HttpProxy {
 			requestContext.setCookieStore(cookieStore);
 		}
 
-		public HttpClientContext getRequestContext() {
+		private HttpClientContext getRequestContext() {
 			return requestContext;
 		}
 
@@ -376,10 +357,12 @@ public class HttpProxy {
      * from the connection manager.
 	 */
 	private static final int CONNECTION_REQUEST_TIMEOUT = 1000;
+
 	/**
 	 * Determines the timeout in milliseconds until a connection is established.
 	 */
 	private static final int CONNECT_TIMEOUT = 1000;
+
 	/**
 	 * Defines the socket timeout ({@code SO_TIMEOUT}) in milliseconds,
      * which is the timeout for waiting for data  or, put differently,
@@ -387,7 +370,15 @@ public class HttpProxy {
 	 */
 	private static final int SOCKET_TIMEOUT = 3000;
 
-	/**
+	private static final int POOL_MAX_SIZE = 100;
+
+	private static final int POOL_MAX_PER_ROUTE = 30;
+
+	private static final int CONNECTION_TTL_SECONDS = 60;
+
+	private static final int CONNECTION_VALIDATE_AFTER_INACTIVITY_SECONDS = 30;
+
+	/*
 	 * 初始化单例的 HttpClient 设置 PoolConnectionManager
 	 */
 	static {
@@ -395,54 +386,61 @@ public class HttpProxy {
 				.setConnectTimeout(CONNECT_TIMEOUT)
 				.setConnectionRequestTimeout(CONNECTION_REQUEST_TIMEOUT)
 				.setSocketTimeout(SOCKET_TIMEOUT).build();
-		PoolingHttpClientConnectionManager connManager = new PoolingHttpClientConnectionManager();
-		// Increase max total connection to 200
-		connManager.setMaxTotal(400);
-		// Increase default max connection per route to 20
-		connManager.setDefaultMaxPerRoute(90);
+
+		PoolingHttpClientConnectionManager connManager = new PoolingHttpClientConnectionManager(CONNECTION_TTL_SECONDS, TimeUnit.SECONDS);
+		connManager.setMaxTotal(POOL_MAX_SIZE);
+		connManager.setDefaultMaxPerRoute(POOL_MAX_PER_ROUTE);
+		connManager.setValidateAfterInactivity(CONNECTION_VALIDATE_AFTER_INACTIVITY_SECONDS);
 
 		HttpHost proxy = new HttpHost("localhost", 8888);
 		DefaultProxyRoutePlanner routePlanner = new DefaultProxyRoutePlanner(proxy);
 
-		CLIENT = HttpClients.custom().setConnectionManager(connManager)
-				.setDefaultRequestConfig(requestConfig).setRoutePlanner(routePlanner).build();
+		CLIENT = HttpClients.custom()
+                .setConnectionManager(connManager)
+				.setDefaultRequestConfig(requestConfig)
+                // .setRoutePlanner(routePlanner)
+                .build();
 	}
 
 	private static final Logger logger = LoggerFactory.getLogger(HttpProxy.class);
 
+	private <R> R doExecute(HttpRequestBase request, Options<R> options) throws IOException {
+	    // if context is null, will request use default context
+        CloseableHttpResponse response = CLIENT.execute(request, options.getRequestContext());
+        HttpEntity respEntity = response.getEntity();
+
+        R returnValue = null;
+        if (InputStream.class.equals(options.getResponseType())) {
+            returnValue = options.callback.apply(respEntity.getContent());
+        } else if (String.class.equals(options.getResponseType())) {
+            String resp = EntityUtils.toString(respEntity, "UTF-8");
+            returnValue = options.callback.apply(resp);
+        }
+
+        return returnValue;
+    }
+
 	/**
-	 * 处理简单的 Http Get 请求，根据 options 中的参数设置 返回不同类型的值，目前支持 InputStream，String
+	 * 处理 Get 请求，根据 options 中的参数设置返回不同类型的值，目前支持 InputStream，String
 	 * 
 	 * @param options
 	 * @return
 	 */
-	public <R> R get(Options<R> options) {
+    public <R> R get(Options<R> options) {
 		HttpGet get = new HttpGet();
 		options.parse(get);
 
 		HttpEntity respEntity = null;
 		R returnValue = null;
 		try {
-			// if context is null, will request use default context
-			CloseableHttpResponse response = CLIENT.execute(get, options.getRequestContext());
-			respEntity = response.getEntity();
-
-			if (InputStream.class.equals(options.getResponseType())) {
-				returnValue = options.callback.apply(respEntity.getContent());
-			} else if (String.class.equals(options.getResponseType())) {
-				String resp = EntityUtils.toString(respEntity, "UTF-8");
-				returnValue = options.callback.apply(resp);
-			}
-			
-//			logger.info("GET request:{}, response:{}" , options.getUri(), JsonUtil.toJson(returnValue, false)); TODO Options 可配置
-
+			returnValue = doExecute(get, options);
 		} catch (IOException e) {
-			logger.error("get 时发生异常 {}", new Object[] { e, options.toString() });
+			logger.error("get 时发生异常, err:{}, options:{} ", e, options.toString());
 		} finally {
 			try {
 				EntityUtils.consume(respEntity);
 			} catch (IOException e) {
-				logger.error("consume 时发生异常 {}", new Object[] { e, options.toString() });
+				logger.error("consume 时发生异常, err:{}, options:{} ", e, options.toString());
 			}
 		}
 
@@ -450,19 +448,7 @@ public class HttpProxy {
 	}
 	
 	/**
-	 * 记得 close response, 或者 EntityUtils.consume(respEntity);
-	 * 
-	 * @param request
-	 * @return
-	 * @throws ClientProtocolException
-	 * @throws IOException
-	 */
-	public CloseableHttpResponse execute(HttpUriRequest request) throws ClientProtocolException, IOException {
-		return CLIENT.execute(request);
-	}
-
-	/**
-	 * 处理 Http Post 请求，根据 options 中的参数设置 返回不同类型的值，目前支持 InputStream，String
+	 * 处理 Post 请求，根据 options 中的参数设置返回不同类型的值，目前支持 InputStream，String
 	 * 
 	 * @param options
 	 * @return
@@ -474,151 +460,17 @@ public class HttpProxy {
 		HttpEntity respEntity = null;
 		R returnValue = null;
 		try {
-
-			// if context is null, will request use default context
-			CloseableHttpResponse response = CLIENT.execute(post, options.getRequestContext());
-			respEntity = response.getEntity();
-
-			if (InputStream.class.equals(options.getResponseType())) {
-				returnValue = options.callback.apply(respEntity.getContent());
-
-			} else if (String.class.equals(options.getResponseType())) {
-				String resp = EntityUtils.toString(respEntity, "UTF-8");
-				returnValue = options.callback.apply(resp);
-			}
-			
-//			logger.info("POST request:{}, response:{}" , options.getUri(), JsonUtil.toJson(returnValue, false)); TODO Options 可配置
+			returnValue = doExecute(post, options);
 		} catch (IOException e) {
-			logger.error("post 时发生异常 {} ", new Object[] { e, options.toString() });
+			logger.error("post 时发生异常, err:{}, options:{} ", e, options.toString());
 		} finally {
 			try {
 				EntityUtils.consume(respEntity);
 			} catch (IOException e) {
-				logger.error("consume 时发生异常 {} ", new Object[] { e, options.toString() });
+				logger.error("consume 时发生异常, err:{}, options:{} ", e, options.toString());
 			}
 		}
 
 		return returnValue;
 	}
-
-	/**
-	 * 将调用接口时的参数转成 URL 中的 QueryString 形式
-	 * 
-	 * <p>
-	 * map: { name=toien, age=11, rank=3000 } ==> name=toien&age=11&rank=3000
-	 * 
-	 * @param params
-	 * @return
-	 */
-	protected String transferToQueryString(Map<String, Object> params) {
-		StringBuffer buffer = new StringBuffer();
-
-		for (Entry<String, Object> entry : params.entrySet()) {
-			buffer.append(entry.getKey()).append("=").append(entry.getValue().toString())
-					.append("&");
-		}
-
-		buffer.deleteCharAt(buffer.length() - 1); // delete last '&'
-
-		return buffer.toString();
-	}
-
-	/**
-	 * 以 POST multipart/form-data 上传图片文件，图片文件位于 form data 的 field 中
-	 * 
-	 * @param url
-	 *            接口 URI
-	 * @param file
-	 *            待上传的文件
-	 * @param fileFieldName
-	 *            form-data 中 文件属性对应的表单名称
-	 * @return 接口调用后的返回值 { code : 0 uri: "http://xxx/yy.jpg" }
-	 */
-	public String uploadByPost(String url, File file, String fileFieldName) {
-		if (!file.exists()) {
-			return null;
-		}
-
-		MultipartEntityBuilder entityBuilder = MultipartEntityBuilder.create();
-
-		HttpPost httpPost = new HttpPost(url);
-
-		FileBody fileBody = new FileBody(file);
-
-		HttpEntity reqEntity = entityBuilder.addPart(fileFieldName, fileBody).build();
-		httpPost.setEntity(reqEntity);
-
-		String returnValue = null;
-		try (CloseableHttpResponse response = CLIENT.execute(httpPost)) {
-
-			HttpEntity respEntity = response.getEntity();
-
-			returnValue = EntityUtils.toString(respEntity, "UTF-8");
-			
-			logger.info("uploadByPost file:{}, response:{}", file, returnValue);
-			EntityUtils.consume(respEntity);
-		} catch (IOException e) {
-			logger.error("uploadByPost 上传文件时发生异常 {} {}", url, e);
-		}
-
-		return returnValue;
-	}
-
-	/**
-	 * 以 PUT image/xxx 上传图片文件，图片文件位于 request body 中
-	 * 
-	 * @param url
-	 * @param file
-	 * @return
-	 */
-	public String uploadByPut(String url, File file) {
-		if (!file.exists()) {
-			return null;
-		}
-
-		HttpPut put = new HttpPut(url);
-		String contentType = "";
-		String fileName = file.getName();
-		switch (fileName.substring(fileName.lastIndexOf(".") + 1)) {
-			case "jpg":
-			case "jpeg":
-				contentType = "image/jpeg";
-				break;
-			case "png":
-				contentType = "image/png";
-				break;
-			case "gif":
-				contentType = "image/gif";
-				break;
-			case "bmp":
-				contentType = "image/bmp";
-				break;
-			case "webp":
-				contentType = "image/webp";
-				break;
-			default: {
-				throw new IllegalArgumentException("uploadByPut 中文件类型错误:" + file.getName());
-			}
-		}
-		put.addHeader("Content-Type", contentType);
-
-		FileEntity reqEntity = new FileEntity(file);
-		put.setEntity(reqEntity);
-
-		String returnValue = null;
-		try (CloseableHttpResponse response = CLIENT.execute(put)) {
-
-			HttpEntity respEntity = response.getEntity();
-
-			returnValue = EntityUtils.toString(respEntity, "UTF-8");
-			
-			logger.info("uploadByPut file:{}, response:{}", file, returnValue);
-			EntityUtils.consume(respEntity);
-		} catch (IOException e) {
-			logger.error("uploadByPut 上传文件时发生异常 {} {}", url, e);
-		}
-
-		return returnValue;
-	}
-
 }
